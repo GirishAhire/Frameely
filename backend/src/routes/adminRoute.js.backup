@@ -1,0 +1,272 @@
+import express from 'express';
+import Order from '../models/Order.js';
+import User from '../models/User.js';
+import { authenticateAdmin } from '../middleware/auth.js';
+import jwt from 'jsonwebtoken';
+import bcrypt from 'bcryptjs';
+
+const router = express.Router();
+
+// GET /api/admin/orders - Get all orders with pagination and filters
+router.get('/orders', authenticateAdmin, async (req, res) => {
+  try {
+    // Special case for dev-token to provide mock data
+    if (req.user && req.user._id === 'dev-admin-id') {
+      console.log('⚠️ Providing mock orders data for dev-token');
+      
+      // Create sample order data
+      const mockOrders = [
+        {
+          _id: 'mock-order-1',
+          userId: { name: 'Test User 1', email: 'test1@example.com' },
+          createdAt: new Date().toISOString(),
+          totalAmount: 1299,
+          status: 'pending',
+          items: [{ 
+            frame: { name: 'Premium Frame', _id: 'frame-1' },
+            size: '8x10',
+            quantity: 1,
+            price: 1299
+          }]
+        },
+        {
+          _id: 'mock-order-2',
+          userId: { name: 'Test User 2', email: 'test2@example.com' },
+          createdAt: new Date(Date.now() - 86400000).toISOString(),
+          totalAmount: 2499,
+          status: 'processing',
+          items: [{ 
+            frame: { name: 'Deluxe Frame', _id: 'frame-2' }, 
+            size: '11x14',
+            quantity: 1,
+            price: 2499
+          }]
+        },
+        {
+          _id: 'mock-order-3',
+          userId: { name: 'Test User 3', email: 'test3@example.com' },
+          createdAt: new Date(Date.now() - 172800000).toISOString(),
+          totalAmount: 3499,
+          status: 'shipped',
+          items: [{ 
+            frame: { name: 'Classic Frame', _id: 'frame-3' }, 
+            size: '16x20',
+            quantity: 1,
+            price: 3499
+          }]
+        }
+      ];
+      
+      return res.json({ 
+        data: mockOrders, 
+        total: mockOrders.length 
+      });
+    }
+
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const skip = (page - 1) * limit;
+    
+    // Build query based on filters
+    const query = {};
+    if (req.query.status && req.query.status !== 'all') {
+      query.status = req.query.status;
+    }
+    if (req.query.search) {
+      query.$or = [
+        { 'shippingAddress.name': { $regex: req.query.search, $options: 'i' } },
+        { 'shippingAddress.email': { $regex: req.query.search, $options: 'i' } },
+        { _id: { $regex: req.query.search, $options: 'i' } }
+      ];
+    }
+
+    // Get orders with pagination
+    const orders = await Order.find(query)
+      .populate({ path: 'userId', select: 'name email', strictPopulate: false })
+      .populate({ path: 'items.frame', strictPopulate: false })
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit);
+
+    // Get total count for pagination
+    const total = await Order.countDocuments(query);
+
+    res.json({ data: orders, total });
+  } catch (err) {
+    console.error('Error fetching orders:', err);
+    res.status(500).json({ error: 'Failed to fetch orders' });
+  }
+});
+
+// PUT /api/admin/orders/:orderId/status - Update order status
+router.put('/orders/:orderId/status', authenticateAdmin, async (req, res) => {
+  try {
+    const { status } = req.body;
+    const order = await Order.findByIdAndUpdate(
+      req.params.orderId,
+      { status },
+      { new: true }
+    )
+    .populate({ path: 'userId', select: 'name email', strictPopulate: false })
+    .populate({ path: 'items.frame', strictPopulate: false });
+
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    res.json(order);
+  } catch (err) {
+    console.error('Error updating order status:', err);
+    res.status(500).json({ error: 'Failed to update order status' });
+  }
+});
+
+// GET /api/admin/dashboard - Get dashboard statistics
+router.get('/dashboard', authenticateAdmin, async (req, res) => {
+  try {
+    // Special case for dev-token to provide mock data
+    if (req.user && req.user._id === 'dev-admin-id') {
+      console.log('⚠️ Providing mock dashboard data for dev-token');
+      return res.json({
+        totalOrders: 48,
+        totalRevenue: 75250,
+        ordersByStatus: {
+          'pending': 12,
+          'processing': 15,
+          'shipped': 8,
+          'delivered': 10,
+          'cancelled': 3
+        },
+        recentOrders: [
+          {
+            _id: 'mock-order-1',
+            userId: { name: 'Test User 1', email: 'test1@example.com' },
+            totalAmount: 1299,
+            status: 'pending'
+          },
+          {
+            _id: 'mock-order-2',
+            userId: { name: 'Test User 2', email: 'test2@example.com' },
+            totalAmount: 2499,
+            status: 'processing'
+          }
+        ],
+        dailyRevenue: [
+          { _id: '2023-05-01', revenue: 12500 },
+          { _id: '2023-05-02', revenue: 9800 },
+          { _id: '2023-05-07', revenue: 7750 }
+        ]
+      });
+    }
+
+    // Get total orders and revenue
+    const orders = await Order.find();
+    const totalOrders = orders.length;
+    const totalRevenue = orders.reduce((sum, order) => sum + order.totalAmount, 0);
+    
+    // Get orders by status
+    const ordersByStatus = await Order.aggregate([
+      {
+        $group: {
+          _id: '$status',
+          count: { $sum: 1 }
+        }
+      }
+    ]);
+
+    // Get recent orders
+    const recentOrders = await Order.find()
+      .populate({ path: 'userId', select: 'name email', strictPopulate: false })
+      .sort({ createdAt: -1 })
+      .limit(5);
+
+    // Get revenue data for the last 7 days
+    const sevenDaysAgo = new Date();
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+    
+    const dailyRevenue = await Order.aggregate([
+      {
+        $match: {
+          createdAt: { $gte: sevenDaysAgo }
+        }
+      },
+      {
+        $group: {
+          _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
+          revenue: { $sum: '$totalAmount' }
+        }
+      },
+      {
+        $sort: { _id: 1 }
+      }
+    ]);
+
+    res.json({
+      totalOrders,
+      totalRevenue,
+      ordersByStatus: ordersByStatus.reduce((acc, curr) => {
+        acc[curr._id] = curr.count;
+        return acc;
+      }, {}),
+      recentOrders,
+      dailyRevenue
+    });
+  } catch (err) {
+    console.error('Error fetching dashboard data:', err);
+    res.status(500).json({ error: 'Failed to fetch dashboard data' });
+  }
+});
+
+// Admin login route
+router.post('/login', async (req, res) => {
+  try {
+    console.log('👉 Login attempt received:', {
+      email: req.body.email,
+      hasPassword: !!req.body.password
+    });
+
+    const { email, password } = req.body;
+    
+    // Check if user exists
+    const user = await User.findOne({ email });
+    console.log('🔍 User lookup result:', {
+      found: !!user,
+      isAdmin: user?.isAdmin,
+      email: user?.email
+    });
+    
+    if (!user) {
+      console.log('❌ No user found with email:', email);
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    if (!user.isAdmin) {
+      console.log('❌ User is not an admin');
+      return res.status(401).json({ error: 'Not authorized as admin' });
+    }
+
+    // Check password using the model's method
+    console.log('🔐 Comparing passwords...');
+    const isMatch = await user.comparePassword(password);
+    console.log('🔑 Password comparison result:', isMatch);
+    
+    if (!isMatch) {
+      console.log('❌ Password does not match');
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    const token = jwt.sign(
+      { userId: user._id, isAdmin: true },
+      process.env.JWT_SECRET || 'your_jwt_secret_key_here',
+      { expiresIn: '7d' }
+    );
+
+    console.log('✅ Login successful, token generated');
+    res.json({ token });
+  } catch (error) {
+    console.error('❌ Login error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+export default router; 
